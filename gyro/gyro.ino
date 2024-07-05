@@ -4,36 +4,123 @@
 #include "MPU6050.h" // by jrowberg,
 #include "I2Cdev.h"  // https://github.com/jrowberg/i2cdevlib
 #include "CRC32.h"   // by bakercp, https://github.com/bakercp/CRC32
-
 WiFiUDP udp;
 uint8_t  udpIn[28];
 uint8_t  udpInfoOut[32];
 uint8_t  udpDataOut[100];
 
-bool serialPlotting = false; // Change when using serial plotter
+#define gyrosenstive 1
+
+
 int16_t accXI, accYI, accZI, gyrPI, gyrYI, gyrRI; // Raw integer orientation data
 float   accXF, accYF, accZF, gyrPF, gyrYF, gyrRF; // Float orientation data
 uint32_t dataPacketNumber = 0; // Current data packet count
-// All time variables are in microseconds
-uint32_t dataSendTime; // Current time
-uint32_t dataRequestTime; // Time of the last data request
-const uint32_t dataSendDelay = 75000; // Time between sending data packages
-const uint32_t dataRequestTimeout = 120000000; // Timeout time for data request, if 0 then disabled
 
+
+// All time variables are in microseconds
+uint32_t u32_Data_SendTime   = 0; // Current time
+uint32_t u32_LstFIFO_ChkTime = 0;
+uint32_t u32_Recv_ChkTime    = 0;
+//Time Period
+#define FIFO_SEND_TIME  1000*1
+#define RECV_CHECKTIME  1000*30
+#define DATA_SEND_TIME  1000*20
+//NetWork Manage
+uint16_t DATA_REPLY_PORT = 0;
+IPAddress DATA_REPLY_IP;
+
+uint16_t INFO_REPLY_PORT = 0;
+IPAddress INFO_REPLY_IP;
+
+//NetWork Packet define
 const uint32_t infoResponseSize = 32;
 const uint32_t dataResponseSize = 100;
-bool shouldSend = false;
-bool delayDataPacket = false;
+
+/***************************************************************************************
+ * FIFO Defined Data
+****************************************************************************************/
+#define FIFOSIZE 100
+typedef struct 
+{
+  uint8_t udpDataOut[100];//数据包
+  uint32_t udpDataSize;
+  uint16_t Port;
+  IPAddress IP;
+  /* data */
+}UdpPacket;
+
+typedef struct
+{
+  uint32_t FIFO_Count;
+  uint32_t Rear;
+  uint32_t Front;
+  UdpPacket udppack[FIFOSIZE]; //fifo size;
+}UdpFifo;
+
+UdpFifo mUdpFifo;
+
+void Fifoinit()
+{
+  mUdpFifo.FIFO_Count = 0;
+  mUdpFifo.Rear       = 0;
+  mUdpFifo.Front      = 0;
+
+}
+
+void FIFO_WritePacket(uint32_t packet_length, uint8_t *packet_Data,  uint16_t Port, IPAddress IP)
+{
+  // 检查FIFO是否已满
+  if(mUdpFifo.FIFO_Count < FIFOSIZE)
+  {
+    // 复制数据到队列中
+    memcpy(mUdpFifo.udppack[mUdpFifo.Rear].udpDataOut, packet_Data, packet_length);
+    // 设置数据包大小
+    mUdpFifo.udppack[mUdpFifo.Rear].udpDataSize = packet_length;
+    mUdpFifo.udppack[mUdpFifo.Rear].Port        = Port;
+    mUdpFifo.udppack[mUdpFifo.Rear].IP          = IP;
+    // 更新队尾指针
+    mUdpFifo.Rear = (mUdpFifo.Rear + 1) % FIFOSIZE;
+    // 增加队列中的数据包计数
+    mUdpFifo.FIFO_Count++;
+  }
+  // 如果FIFO已满，不执行任何操作
+}
+
+void FIFO_SendPacket()
+{
+  // 检查FIFO是否为空
+  if( mUdpFifo.FIFO_Count != 0)
+  {
+    if(mUdpFifo.udppack[mUdpFifo.Front].Port == 0)
+    {
+       // 更新队首指针
+      mUdpFifo.Front = (mUdpFifo.Front + 1) % FIFOSIZE;
+      // 减少队列中的数据包计数
+      mUdpFifo.FIFO_Count--;
+      return;
+    }
+    // 发送队首的数据包
+    udp.beginPacket(mUdpFifo.udppack[mUdpFifo.Front].IP, mUdpFifo.udppack[mUdpFifo.Front].Port);
+    udp.write(mUdpFifo.udppack[mUdpFifo.Front].udpDataOut, mUdpFifo.udppack[mUdpFifo.Front].udpDataSize);
+   // Serial.println("sendone");
+    udp.endPacket();
+    // 更新队首指针
+    mUdpFifo.Front = (mUdpFifo.Front + 1) % FIFOSIZE;
+    // 减少队列中的数据包计数
+    mUdpFifo.FIFO_Count--;
+  }
+  // 如果FIFO为空，不执行任何操作
+}
 
 /***************************************************************************************
  * User Defined Data
 ****************************************************************************************/
 
-char wifiSSID[] = "********";
-char wifiPass[] = "********";
+char wifiSSID[] = "CMCC-b74H";
+char wifiPass[] = "nw7kqrm6";
 uint16_t udpPort = 26760;
 
-const uint8_t MPU6050_sda = 4, MPU6050_scl = 5; // MPU6050 I2C GPIO connection
+const uint8_t MPU6050_sda = 4, MPU6050_scl = 5; // MPU6050 I2C GPIO connection。scl d1 sda d2
 const uint8_t MPU_addr = 0x68; // I2C address of the MPU-6050
 
 
@@ -51,18 +138,18 @@ bool signTable[] = // If true change sign
   false, // accXI
   false, // accYI
   true,  // accZI
-  true,  // gyrPI
+  false,  // gyrPI
   false, // gyrYI
-  true,  // gyrRI
+  false,  // gyrRI
 };
 int16_t offsetTable[] =
 {
   -2818, // accXI
   2461, // accYI
   1148, // accZI
-  -47, // gyrPI
-  -72, // gyrYI
-  35, // gyrRI
+  1, // gyrPI
+  1, // gyrYI
+  1, // gyrRI
 };
 
 
@@ -77,7 +164,7 @@ MPU6050 accgyr;
 // Gyro sensitivity 0: +/-250 deg/s, 1: +/-500 deg/s, 2: +/-1000 deg/s, 3: +/-2000 deg/s
 // If set too low it will introduce clipping
 // If set too high it will decrease sensitity
-const uint8_t gyroSens = 2;
+const uint8_t gyroSens = gyrosenstive;
 const float gyroLSB = 131.0f / pow(2, gyroSens);
 
 // Info package response packet
@@ -281,56 +368,16 @@ void setup()
   accgyr.setYGyroOffset(offsetTable[4]);
   accgyr.setZGyroOffset(offsetTable[5]);  
 
-  dataRequestTime = micros(); // Set dataRequestTime, so that if we won't get a data request in time we will shutdown
-
   Serial.println("Setup done!");     
 }
+
 void loop() 
 {
-  uint8_t packetInSize = udp.parsePacket();
-  if (packetInSize)
-  {
-    udp.read(udpIn, sizeof(udpIn));
-    switch(udpIn[16]) // udpIn[16] - Least significant byte of event type
-    {
-      case 0x01: // Information about controllers
-        Serial.println("Got info request!");        
-
-        for (uint8_t i = 0; i < udpIn[20]; i++) // udpIn[20] - Amount of ports we should report about
-        {
-          makeInfoPackage(&udpInfoOut[0], udpIn[24 + i]); // udpIn[24 + i] - Slot numbers to report about
-  
-          udp.beginPacket(udp.remoteIP(), udp.remotePort());
-          udp.write(udpInfoOut, infoResponseSize);
-          udp.endPacket();        
-        }
-        shouldSend = false;
-      break;
-      case 0x02: // Controller input data
-        Serial.println("Got data request!");      
-        
-        dataRequestTime = micros(); // Refresh timeout timer        
-        shouldSend = true;
-      break;      
-    }
-  } 
-  if (dataRequestTimeout && (micros() - dataRequestTime > dataRequestTimeout)) // Check if timedout by a lack of controller data requests
-  {    
-    // If we haven't received any datapacket in time,
-    // than orientation information is not needed, so we will shutdown to save energy for the gamepad
-    Serial.println("Shutting down..."); Serial.flush();
-    ESP.deepSleep(0); 
-  }
-  if (delayDataPacket && shouldSend)
-  {
-    udp.beginPacket(udp.remoteIP(), udp.remotePort());
-    udp.write(udpDataOut, dataResponseSize);
-    udp.endPacket();
-    delayDataPacket = false;
-  }
-  if ((micros() - dataSendTime > dataSendDelay) && shouldSend) // Check if enough time has elapsed between data packets
+  //1. True control data send
+  if ((micros() - u32_Data_SendTime > DATA_SEND_TIME)) // Check if enough time has elapsed between data packets
   {            
-    dataPacketNumber++; dataSendTime = micros();
+    dataPacketNumber++; 
+    u32_Data_SendTime = micros();
     
     accgyr.getMotion6(swapTable[0], swapTable[1], swapTable[2], swapTable[3], swapTable[4], swapTable[5]);  
 
@@ -359,26 +406,44 @@ void loop()
     gyrRF = gyrRI / gyroLSB;
     
     gyrYF -= gyrOffYF;
-
-    if (serialPlotting) 
-    {
-        Serial.print(" AX: "); Serial.print(accXF);
-        Serial.print(" AY: "); Serial.print(accYF);
-        Serial.print(" AZ: "); Serial.print(accZF);
-        Serial.print(" GP: "); Serial.print(gyrPF);
-        Serial.print(" GY: "); Serial.print(gyrYF);
-        Serial.print(" GR: "); Serial.println(gyrRF);  
-    }
+    makeDataPackage(&udpDataOut[0], dataPacketNumber, u32_Data_SendTime, accXF, accYF, accZF, gyrPF, gyrYF, gyrRF);
+    FIFO_WritePacket(dataResponseSize,udpDataOut,DATA_REPLY_PORT,DATA_REPLY_IP);  
     
-    makeDataPackage(&udpDataOut[0], dataPacketNumber, dataSendTime, accXF, accYF, accZF, gyrPF, gyrYF, gyrRF);
-
-    if (udp.parsePacket() == 0)
-    {
-      udp.beginPacket(udp.remoteIP(), udp.remotePort());
-      udp.write(udpDataOut, dataResponseSize);
-      udp.endPacket();
-    }
-    else    
-      delayDataPacket = true;
   }
+
+  //2. Client msg check
+  if(micros() - u32_Recv_ChkTime > RECV_CHECKTIME)
+  {
+    u32_Recv_ChkTime = micros();
+    uint8_t packetInSize = udp.parsePacket();
+    if (packetInSize)
+    {
+      udp.read(udpIn, sizeof(udpIn));
+      switch(udpIn[16]) // udpIn[16] - Least significant byte of event type
+      {
+        case 0x01: // Information about controllers
+            for (uint8_t i = 0; i < 4; i++) // udpIn[20] - Amount of ports we should report about
+            {
+              makeInfoPackage(udpInfoOut, i); // udpIn[24 + i] - Slot numbers to report about
+              FIFO_WritePacket(infoResponseSize,udpInfoOut,udp.remotePort(),udp.remoteIP());  
+            }
+            INFO_REPLY_PORT = udp.remotePort();
+            INFO_REPLY_IP   = udp.remoteIP();
+        // Serial.println("Got info request!");       
+        break;
+        case 0x02: // Controller input data
+              DATA_REPLY_IP   = udp.remoteIP();
+              DATA_REPLY_PORT = udp.remotePort();
+        break;      
+      }  
+    }
+  }
+
+  //3. msg fifo send
+  if ((micros() - u32_LstFIFO_ChkTime > FIFO_SEND_TIME)) // Check if enough time has elapsed between data packets
+  { 
+    u32_LstFIFO_ChkTime  = micros();
+    FIFO_SendPacket();
+  }
+
 }
